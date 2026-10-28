@@ -12,6 +12,9 @@ const CATS = ['subject', 'object', 'predicate', 'complement', 'modifier', 'adver
 const MAX_WORDS = 14;
 const MAX_PART = 5;   // 참신성 5점 + 진심 5점 = 10점 만점
 const SUBMIT_GAP_MS = Number(process.env.SUBMIT_GAP_MS || 800);
+const MIN_KINDS = 4;                                          // 고백에 쓰는 문장 성분은 서로 다른 종류가 4가지 이상
+const LOCK_MS = Number(process.env.LOCK_MS || 10000);         // 오답 뒤에 문제를 못 푸는 시간 (10초)
+const MAX_QUESTIONS = 60;
 
 if (!process.env.TEACHER_PIN) {
   console.warn('[주의] TEACHER_PIN 환경변수가 없어서 교사 비밀번호가 0000 이에요. 배포할 때 꼭 바꿔 주세요.');
@@ -19,6 +22,7 @@ if (!process.env.TEACHER_PIN) {
 
 /* ---------- 상태 (서버를 다시 켜면 초기화돼요) ---------- */
 let deck = loadDeck();
+let questions = loadQuestions();   // 외톨이의 방 문제: [{ id, q, a }]
 const students = new Map();   // clientId -> { group, streams:Set<res>, lastSubmit }
 let nextGroup = 1;
 let proposals = [];           // { id, from, to, text, at }
@@ -57,10 +61,81 @@ function enabledDeck() {
   });
   return out;
 }
-function enabledTexts() {
-  const set = new Set();
-  CATS.forEach(function (k) { deck[k].cards.forEach(function (c) { if (c.on) set.add(c.text); }); });
-  return set;
+
+/* ---------- 문제와 외톨이의 방 ---------- */
+// 문제와 정답 칸은 입력 도중 비어 있을 수 있어서 저장은 하되, 둘 다 적힌 문제만 실제로 내요.
+function cleanQuestions(list) {
+  if (!Array.isArray(list) || list.length > MAX_QUESTIONS) return null;
+  const out = [];
+  const seen = {};
+  for (const x of list) {
+    if (!x || typeof x.q !== 'string' || typeof x.a !== 'string') return null;
+    let id = typeof x.id === 'string' && /^[\w-]{1,40}$/.test(x.id) ? x.id : null;
+    if (!id || seen[id]) id = 'q' + crypto.randomBytes(4).toString('hex');
+    seen[id] = true;
+    out.push({
+      id: id,
+      q: x.q.replace(/\s+/g, ' ').trim().slice(0, 200),
+      a: x.a.replace(/\s+/g, ' ').trim().slice(0, 100)
+    });
+  }
+  return out;
+}
+function loadQuestions() {
+  try {
+    return cleanQuestions(JSON.parse(fs.readFileSync(path.join(__dirname, 'questions.json'), 'utf8'))) || [];
+  } catch (e) { return []; }
+}
+function usableQuestions() { return questions.filter(function (x) { return x.q && x.a; }); }
+// 아직 못 만난 문제를 먼저 내고, 다 만났으면 처음부터 다시 돌아요.
+function pickQuestion(s) {
+  const pool = usableQuestions();
+  if (!pool.length) return null;
+  let fresh = pool.filter(function (x) { return !s.asked.has(x.id); });
+  if (!fresh.length) { s.asked.clear(); fresh = pool; }
+  const x = fresh[Math.floor(Math.random() * fresh.length)];
+  s.asked.add(x.id);
+  return x.id;
+}
+function studentByGroup(g) {
+  let found = null;
+  students.forEach(function (s) { if (s.group === g) found = s; });
+  return found;
+}
+function jailStudent(s, reason, byGroup) {
+  if (s.jail) return false;
+  s.jail = { since: Date.now(), reason: reason, byGroup: byGroup || null, qid: pickQuestion(s), lockedUntil: 0 };
+  return true;
+}
+function currentQuestion(s) {
+  if (!s.jail) return null;
+  let x = questions.find(function (q) { return q.id === s.jail.qid && q.q && q.a; });
+  if (!x) {                      // 선생님이 문제를 지웠거나 아직 없던 경우: 새로 골라요
+    s.jail.qid = pickQuestion(s);
+    x = questions.find(function (q) { return q.id === s.jail.qid; }) || null;
+  }
+  return x || null;
+}
+// 학생에게는 정답을 절대 보내지 않고, 교사에게만 보내요.
+function jailInfo(s, forTeacher) {
+  if (!s.jail) return null;
+  const x = currentQuestion(s);
+  const info = {
+    reason: s.jail.reason, byGroup: s.jail.byGroup, since: s.jail.since,
+    question: x ? x.q : null,
+    lockLeftMs: Math.max(0, s.jail.lockedUntil - Date.now())
+  };
+  if (forTeacher) info.answer = x ? x.a : null;
+  return info;
+}
+// 띄어쓰기, 대소문자, 문장부호는 무시하고 비교해요. 정답이 여러 개면 / 로 나눠 적어요.
+function normAns(t) {
+  return String(t).normalize('NFC').toLowerCase().replace(/[\s.,!?'"“”‘’~·\-_()\[\]{}:;\\\/]/g, '');
+}
+function isCorrect(expected, given) {
+  const g = normAns(given);
+  if (!g) return false;
+  return String(expected).split('/').some(function (alt) { const n = normAns(alt); return n && n === g; });
 }
 function onlineGroups() {
   const list = [];
@@ -98,6 +173,8 @@ function studentSnapshot(s) {
     group: s.group,
     others: onlineGroups().filter(function (g) { return g !== s.group; }).length,
     deck: enabledDeck(),
+    minKinds: MIN_KINDS,
+    jail: jailInfo(s, false),
     inbox: proposals.filter(function (p) { return p.to === s.group; }).slice(-60).reverse(),
     outbox: proposals.filter(function (p) { return p.from === s.group; }).slice(-60).reverse()
   };
@@ -126,11 +203,12 @@ function teacherSnapshot() {
     members.push({
       group: s.group, online: online.has(s.group),
       sent: r.sent, received: r.received, replied: r.replied, accepted: r.accepted,
-      avg: r.scored ? Math.round(r.sum / r.scored * 10) / 10 : null
+      avg: r.scored ? Math.round(r.sum / r.scored * 10) / 10 : null,
+      jail: jailInfo(s, true)
     });
   });
   members.sort(function (a, b) { return a.group - b.group; });
-  return { type: 'state', members: members, proposals: proposals.slice(-500).reverse(), deck: deck };
+  return { type: 'state', members: members, proposals: proposals.slice(-500).reverse(), deck: deck, questions: questions, minKinds: MIN_KINDS };
 }
 let timer = null;
 function schedule() {
@@ -165,7 +243,7 @@ function readBody(req) {
     const chunks = [];
     req.on('data', function (c) {
       size += c.length;
-      if (size > 30000) { reject(new Error('too large')); req.destroy(); return; }
+      if (size > 120000) { reject(new Error('too large')); req.destroy(); return; }
       chunks.push(c);
     });
     req.on('end', function () {
@@ -223,7 +301,7 @@ const server = http.createServer(async function (req, res) {
       if (!validId(b.clientId)) { json(res, 400, { error: 'bad-id' }); return; }
       let s = students.get(b.clientId);
       if (!s) {
-        s = { group: nextGroup++, streams: new Set(), lastSubmit: 0 };
+        s = { group: nextGroup++, streams: new Set(), lastSubmit: 0, jail: null, asked: new Set() };
         students.set(b.clientId, s);
         schedule();
       }
@@ -245,19 +323,26 @@ const server = http.createServer(async function (req, res) {
       const b = await readBody(req);
       const s = validId(b.clientId) ? students.get(b.clientId) : null;
       if (!s) { json(res, 410, { error: 'unknown-client' }); return; }
-      const words = b.words;
-      const allowed = enabledTexts();
-      if (!Array.isArray(words) || words.length < 2 || words.length > MAX_WORDS ||
-          !words.every(function (w) { return typeof w === 'string' && allowed.has(w); })) {
-        json(res, 400, { error: 'bad-words' }); return;
-      }
+      if (s.jail) { json(res, 423, { error: 'jailed' }); return; }
+      // 카드마다 { cat: 성분 종류, text: 글자 } 를 받고, 지금 켜져 있는 카드 목록과 맞는지 확인해요.
+      const cards = b.cards;
+      const valid = Array.isArray(cards) && cards.length >= MIN_KINDS && cards.length <= MAX_WORDS &&
+        cards.every(function (c) {
+          return c && CATS.indexOf(c.cat) >= 0 && typeof c.text === 'string' &&
+            deck[c.cat].cards.some(function (d) { return d.on && d.text === c.text; });
+        });
+      if (!valid) { json(res, 400, { error: 'bad-words' }); return; }
+      const kinds = new Set(cards.map(function (c) { return c.cat; })).size;
+      if (kinds < MIN_KINDS) { json(res, 400, { error: 'few-kinds', need: MIN_KINDS }); return; }
       const now = Date.now();
       if (now - s.lastSubmit < SUBMIT_GAP_MS) { json(res, 429, { error: 'too-fast' }); return; }
       const to = pickTarget(s.group);
       if (to == null) { json(res, 409, { error: 'no-target' }); return; }
       s.lastSubmit = now;
       proposals.push({
-        id: ++propSeq, from: s.group, to: to, text: words.join(' '), at: now,
+        id: ++propSeq, from: s.group, to: to, at: now,
+        text: cards.map(function (c) { return c.text; }).join(' '),
+        parts: cards.map(function (c) { return { cat: c.cat, text: c.text }; }),
         status: 'pending', reason: '', novelty: null, sincerity: null, score: null, answeredAt: null
       });
       if (proposals.length > 5000) proposals = proposals.slice(-5000);
@@ -281,8 +366,34 @@ const server = http.createServer(async function (req, res) {
       prop.sincerity = b.sincerity;
       prop.score = b.novelty + b.sincerity;
       prop.answeredAt = Date.now();
+      if (decision === 'rejected') {               // 거절당한 조는 외톨이의 방으로 가요
+        const sender = studentByGroup(prop.from);
+        if (sender) jailStudent(sender, 'rejected', prop.to);
+      }
       schedule();
       json(res, 200, { ok: true, score: prop.score });
+      return;
+    }
+
+    if (req.method === 'POST' && p === '/api/answer') {
+      const b = await readBody(req);
+      const s = validId(b.clientId) ? students.get(b.clientId) : null;
+      if (!s) { json(res, 410, { error: 'unknown-client' }); return; }
+      if (!s.jail) { json(res, 409, { error: 'not-jailed' }); return; }
+      const now = Date.now();
+      if (now < s.jail.lockedUntil) { json(res, 429, { error: 'locked', lockLeftMs: s.jail.lockedUntil - now }); return; }
+      const x = currentQuestion(s);
+      if (!x) { json(res, 409, { error: 'no-question' }); return; }
+      if (typeof b.answer !== 'string' || b.answer.length > 200 || !normAns(b.answer)) { json(res, 400, { error: 'bad-answer' }); return; }
+      if (isCorrect(x.a, b.answer)) {
+        s.jail = null;
+        schedule();
+        json(res, 200, { correct: true });
+        return;
+      }
+      s.jail.lockedUntil = now + LOCK_MS;           // 오답: 정해진 시간 동안 못 풀어요
+      schedule();
+      json(res, 200, { correct: false, lockLeftMs: LOCK_MS });
       return;
     }
 
@@ -319,6 +430,29 @@ const server = http.createServer(async function (req, res) {
         const cards = cleanCards(b.cards);
         if (CATS.indexOf(b.key) < 0 || !cards) { json(res, 400, { error: 'bad-deck' }); return; }
         deck[b.key].cards = cards;
+        schedule();
+        json(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === 'GET' && p === '/api/teacher/questions.json') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="questions.json"' });
+        res.end(JSON.stringify(questions, null, 2));
+        return;
+      }
+      if (req.method === 'POST' && p === '/api/teacher/questions') {
+        const b = await readBody(req);
+        const list = cleanQuestions(b.questions);
+        if (!list) { json(res, 400, { error: 'bad-questions' }); return; }
+        questions = list;
+        schedule();
+        json(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === 'POST' && (p === '/api/teacher/jail' || p === '/api/teacher/release')) {
+        const b = await readBody(req);
+        const s = Number.isInteger(b.group) ? studentByGroup(b.group) : null;
+        if (!s) { json(res, 404, { error: 'no-group' }); return; }
+        if (p === '/api/teacher/jail') jailStudent(s, 'teacher', null); else s.jail = null;
         schedule();
         json(res, 200, { ok: true });
         return;
